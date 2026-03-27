@@ -1,0 +1,14 @@
+{
+  "identities": [
+    {
+      "name": "mlplatform",
+      "credentials": [
+        {
+          "accessKey": "mlplatform-access-key",
+          "secretKey": "mlplatform-secret-key"
+        }
+      ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}
