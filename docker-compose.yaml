@@ -3,26 +3,23 @@ services:
   # Single instance with 3 databases: mlflow_db, airflow_db, platform_db
   postgres:
     image: postgres:18.3
-    mem_limit: 512m
-    cpus: 1.0
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD}
     volumes:
       - ./config/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
-      - pg_data:/var/lib/postgresql/data
+      - pg_data:/var/lib/postgresql
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
+      test: ["CMD-SHELL", "pg_isready -U postgres -d airflow_db && psql -U postgres -d airflow_db -c 'SELECT 1' > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 60s
 
   # ── SeaweedFS (S3-compatible object storage) ────────────────────────────────
   seaweedfs:
     image: chrislusf/seaweedfs:4.17
-    mem_limit: 256m
-    cpus: 0.5
     command: "server -master -volume -filer -s3 -s3.config=/etc/seaweedfs/s3.json -filer.port=8888 -ip.bind=0.0.0.0"
     volumes:
       - ./config/seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
@@ -32,30 +29,30 @@ services:
       - "9333:9333"
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:9333/cluster/status || exit 1"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 15s
 
   # ── MLflow tracking server ──────────────────────────────────────────────────
   mlflow:
     build:
       context: ./dockerfiles
       dockerfile: mlflow.Dockerfile
-    mem_limit: 512m
-    cpus: 0.5
     command: >
       mlflow server
       --backend-store-uri postgresql://${MLFLOW_DB_USER}:${MLFLOW_DB_PASSWORD}@postgres:5432/mlflow_db
       --default-artifact-root s3://mlplatform-artifacts/
       --host 0.0.0.0
       --port 5000
+      --workers 1
       --allowed-hosts "*"
     environment:
       AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
       AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
       MLFLOW_S3_ENDPOINT_URL: http://seaweedfs:8333
     ports:
-      - "5000:5000"
+      - "15000:5000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -63,18 +60,16 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000/health')\" || exit 1"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
-      start_period: 10s
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
 
   # ── Airflow (standalone mode with DockerOperator) ───────────────────────────
   airflow:
     build:
       context: ./dockerfiles
       dockerfile: airflow.Dockerfile
-    mem_limit: 1g
-    cpus: 1.0
     command: airflow standalone
     restart: unless-stopped
     environment:
@@ -83,23 +78,24 @@ services:
       AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "10"
-      AIRFLOW__SCHEDULER__SCHEDULER_HEALTH_CHECK_THRESHOLD: "120"
+      AIRFLOW__SCHEDULER__SCHEDULER_HEALTH_CHECK_THRESHOLD: "240"
+      HOST_PROJECT_DIR: ${HOST_PROJECT_DIR:-/Users/satrijandi/code/ml-platform}
     group_add:
       - "${DOCKER_GID}"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./dags:/opt/airflow/dags
     ports:
-      - "8080:8080"
+      - "18080:8080"
     depends_on:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8080/api/v2/monitor/health | python3 -c \"import sys,json; d=json.load(sys.stdin); sys.exit(0 if d['scheduler']['status']=='healthy' else 1)\""]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-      start_period: 90s
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,json; d=json.loads(urllib.request.urlopen('http://localhost:8080/api/v2/monitor/health').read()); exit(0 if d['dag_processor']['status']=='healthy' else 1)\""]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
 
   # ── PySparkling (standalone batch service for Airflow DockerOperator) ───────
   pysparkling:
@@ -107,8 +103,6 @@ services:
       context: ./dockerfiles
       dockerfile: pysparkling.Dockerfile
     image: pysparkling:latest
-    mem_limit: 1g
-    cpus: 1.0
     profiles: ["tools"]
     environment:
       AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
@@ -118,19 +112,45 @@ services:
     entrypoint: ["spark-submit"]
     command: ["--help"]
 
+  # ── Model serving API ────────────────────────────────────────────────────────
+  model-serving:
+    build:
+      context: ./dockerfiles
+      dockerfile: serving.Dockerfile
+    command: ["/opt/scripts/serve.py"]
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_S3_ENDPOINT_URL: http://seaweedfs:8333
+      SERVE_PORT: "8000"
+    volumes:
+      - ./scripts:/opt/scripts:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\" || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+
   # ── JupyterLab (interactive development with PySparkling) ──────────────────
   jupyterlab:
     build:
       context: ./dockerfiles
       dockerfile: jupyterlab.Dockerfile
-    mem_limit: 2g
-    cpus: 2.0
     environment:
       MLFLOW_TRACKING_URI: http://mlflow:5000
       AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
       AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
       MLFLOW_S3_ENDPOINT_URL: http://seaweedfs:8333
       JUPYTER_ENABLE_LAB: "yes"
+      JUPYTER_TOKEN: ""
+    command: start-notebook.py --IdentityProvider.token=''
     volumes:
       - ./notebooks:/home/jovyan/work
     ports:
@@ -141,8 +161,8 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8888/api/status || exit 1"]
       interval: 10s
-      timeout: 5s
-      retries: 15
+      timeout: 10s
+      retries: 20
       start_period: 30s
 
 volumes:
